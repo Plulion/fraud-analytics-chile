@@ -1,3 +1,27 @@
+"""
+Leakage-aware supervised training-dataset construction.
+
+This module combines feature snapshots with investigation feedback to produce
+a clean dataset suitable for later machine-learning experiments.
+
+Business rules
+--------------
+- Only active feedback may be used as a supervised label.
+- Invalidated, revoked, or superseded feedback remains in history but is
+  excluded from training.
+- ``CONFIRMADO`` maps to label ``1`` and ``DESCARTADO`` maps to label ``0``.
+- A case may contribute at most one active supervised label.
+- Feature snapshots must exist before or at case closure.
+- Post-investigation fields are forbidden as predictors.
+- Excluded records are preserved in a structured exclusion report.
+
+Interpretation
+--------------
+The output is a prepared educational dataset, not a production-ready training
+corpus. Its quality depends on investigation quality, feedback governance,
+feature provenance, temporal integrity, and sufficient representative volume.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,6 +30,8 @@ from typing import Any, Iterable
 import pandas as pd
 
 
+# Backward-compatible default for feedback created before lifecycle status
+# was introduced. Explicit lifecycle values always take precedence.
 DEFAULT_FEEDBACK_STATUS = "ACTIVO"
 
 
@@ -25,6 +51,8 @@ REQUIRED_FEEDBACK_COLUMNS = {
 }
 
 
+# Supervised target mapping derived from the approved investigation result,
+# never from the original analytical risk score.
 ALLOWED_OUTCOMES = {
     "CONFIRMADO": 1,
     "DESCARTADO": 0,
@@ -33,6 +61,18 @@ ALLOWED_OUTCOMES = {
 
 @dataclass(frozen=True)
 class TrainingDatasetResult:
+    """
+    Immutable container returned by training-dataset construction.
+
+    Attributes:
+        dataset:
+            Clean rows accepted for supervised learning.
+        exclusions:
+            Rejected rows with machine-readable and human-readable reasons.
+        report:
+            JSON-serializable quality and class-balance summary.
+    """
+
     dataset: pd.DataFrame
     exclusions: pd.DataFrame
     report: dict[str, Any]
@@ -41,6 +81,12 @@ class TrainingDatasetResult:
 def normalize_text(
     value: Any,
 ) -> str:
+    """
+    Convert a scalar value into normalized text.
+
+    Missing values become an empty string. Other values are converted to text
+    and stripped of surrounding whitespace.
+    """
     if value is None:
         return ""
 
@@ -56,6 +102,7 @@ def normalize_text(
 def normalize_upper_text(
     value: Any,
 ) -> str:
+    """Normalize a scalar value and convert it to uppercase."""
     return normalize_text(
         value
     ).upper()
@@ -66,6 +113,12 @@ def validate_required_columns(
     required_columns: set[str],
     dataset_name: str,
 ) -> None:
+    """
+    Validate the minimum schema required by a dataset operation.
+
+    Raises:
+        ValueError: If one or more required columns are missing.
+    """
     missing_columns = (
         required_columns.difference(
             df.columns
@@ -83,6 +136,12 @@ def validate_required_columns(
 def parse_datetime_series(
     series: pd.Series,
 ) -> pd.Series:
+    """
+    Parse a Series as timezone-aware UTC timestamps.
+
+    Invalid values become ``NaT`` so later validation can reject or report
+    them explicitly.
+    """
     return pd.to_datetime(
         series,
         errors="coerce",
@@ -94,6 +153,15 @@ def parse_datetime_series(
 def ensure_feedback_status(
     feedback_df: pd.DataFrame,
 ) -> pd.DataFrame:
+    """
+    Ensure a normalized feedback lifecycle-status column exists.
+
+    Older feedback registries without ``feedback_status`` are treated as
+    active for backward compatibility.
+
+    Returns:
+        A copied DataFrame with uppercase normalized lifecycle values.
+    """
     result = feedback_df.copy()
 
     if "feedback_status" not in result.columns:
@@ -120,6 +188,14 @@ def ensure_feedback_status(
 def validate_binary_labels(
     feedback_df: pd.DataFrame,
 ) -> None:
+    """
+    Validate binary labels and their consistency with investigation outcomes.
+
+    Raises:
+        ValueError:
+            If labels are non-binary, outcomes are unknown, or an outcome-label
+            pair contradicts the configured mapping.
+    """
     numeric_labels = pd.to_numeric(
         feedback_df["outcome_label"],
         errors="coerce",
@@ -208,6 +284,17 @@ def validate_feature_columns(
     features_df: pd.DataFrame,
     feature_columns: Iterable[str],
 ) -> list[str]:
+    """
+    Validate requested predictors and reject known leakage fields.
+
+    Returns:
+        A normalized list of permitted feature-column names.
+
+    Raises:
+        ValueError:
+            If the list is empty, duplicated, missing from the source table,
+            or contains post-investigation or target-derived fields.
+    """
     columns = [
         normalize_text(column)
         for column in feature_columns
@@ -254,6 +341,8 @@ def validate_feature_columns(
             f"{missing}"
         )
 
+    # These fields are unavailable at prediction time or directly encode the
+    # target. Allowing them would create target or post-outcome leakage.
     forbidden_columns = {
         "outcome_label",
         "investigation_outcome",
@@ -290,6 +379,12 @@ def build_exclusion_row(
     reason_code: str,
     reason_detail: str,
 ) -> dict[str, str]:
+    """
+    Build one normalized training-record exclusion entry.
+
+    Returns:
+        A dictionary using the canonical exclusion schema.
+    """
     return {
         "case_id": normalize_text(
             case_id
@@ -314,17 +409,22 @@ def resolve_feedback_lifecycle(
     feedback_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Consolida múltiples versiones del mismo feedback.
+    Resolve multiple lifecycle versions of the same feedback record.
 
-    Si para una resolución existen registros ACTIVO e
-    INVALIDADO, prevalece INVALIDADO. Esto evita usar
-    por accidente una etiqueta que fue anulada después.
+    For one case-resolution pair, invalidated, revoked, or superseded states
+    take precedence over active state. This prevents a historically active
+    label from being reused after later invalidation.
+
+    Returns:
+        One lifecycle-resolved feedback row per case and resolution.
     """
 
     feedback = ensure_feedback_status(
         feedback_df
     )
 
+    # Inactive lifecycle states outrank ACTIVO so a later invalidation cannot
+    # be hidden by an earlier active row for the same resolution.
     status_rank = {
         "INVALIDADO": 3,
         "REVOCADO": 3,
@@ -404,11 +504,29 @@ def build_training_dataset(
     feature_columns: Iterable[str],
 ) -> TrainingDatasetResult:
     """
-    Construye un dataset supervisado con etiquetas
-    investigativas activas y variables disponibles
-    antes o al momento del cierre.
+    Build a leakage-aware supervised training dataset.
 
-    Cada caso aporta como máximo una etiqueta activa.
+    Feature snapshots are joined to lifecycle-resolved investigation feedback.
+    Only active, consistent, temporally valid records are retained. Every
+    rejection is recorded instead of being silently discarded.
+
+    Args:
+        features_df:
+            One-row-per-case feature snapshots captured before outcome
+            knowledge.
+        feedback_df:
+            Investigation outcomes and feedback lifecycle records.
+        feature_columns:
+            Predictor columns explicitly authorized for training.
+
+    Returns:
+        ``TrainingDatasetResult`` containing accepted rows, exclusions, and a
+        summary report.
+
+    Raises:
+        ValueError:
+            If schemas, identifiers, timestamps, labels, or selected feature
+            columns are inconsistent.
     """
 
     validate_required_columns(
@@ -539,6 +657,8 @@ def build_training_dataset(
             ]
         )
 
+        # Historical feedback is retained for auditability but excluded from
+        # model training whenever it is no longer active.
         if feedback_status != "ACTIVO":
             exclusions.append(
                 build_exclusion_row(
@@ -617,6 +737,8 @@ def build_training_dataset(
             )
         )
 
+        # A snapshot recorded after closure contains future information and
+        # therefore cannot represent what the model would have known in time.
         if feature_snapshot_at > closed_at:
             exclusions.append(
                 build_exclusion_row(
@@ -685,6 +807,8 @@ def build_training_dataset(
             .value_counts()
         )
 
+        # More than one active label for one case is ambiguous. Exclude all
+        # affected rows instead of selecting one arbitrarily.
         duplicated_active_cases = set(
             active_case_counts.loc[
                 active_case_counts > 1
