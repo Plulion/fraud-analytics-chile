@@ -1,3 +1,30 @@
+"""
+Operational dashboard and KPI calculations for fraud investigations.
+
+The module transforms case, audit, and prioritization records into:
+
+- a case-level operational dashboard;
+- an analyst workload summary;
+- global investigation-process KPIs.
+
+Business interpretation
+-----------------------
+The dashboard measures operational handling. It does not determine whether
+fraud occurred and does not replace human investigation.
+
+The SLA implemented here measures elapsed time from case creation to the
+start of investigation. Its targets are educational values that require
+calibration before production use.
+
+Data-quality principles
+-----------------------
+- Required schemas are validated before calculations.
+- Case identifiers must be unique in case-level tables.
+- Timestamps are normalized to UTC before comparison.
+- Negative durations are rejected instead of silently corrected.
+- Audit history is used to reconstruct assignment and investigation start.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -40,6 +67,9 @@ REQUIRED_PRIORITY_COLUMNS = {
 }
 
 
+# Final investigative outcomes remain operationally open until the
+# workflow records the explicit CERRADO state. This preserves the separate
+# approval and closure steps.
 OPEN_STATUSES = {
     "NUEVO",
     "ASIGNADO",
@@ -56,6 +86,9 @@ CLOSED_STATUSES = {
 }
 
 
+# Educational investigation-start SLA targets. Production values would
+# require calibration against staffing capacity, risk appetite, and formal
+# service commitments.
 PRIORITY_SLA_HOURS = {
     "CRITICA": 2.0,
     "ALTA": 8.0,
@@ -67,6 +100,12 @@ PRIORITY_SLA_HOURS = {
 def normalize_text(
     value: Any,
 ) -> str:
+    """
+    Convert a scalar value into normalized text.
+
+    Missing values become an empty string. Other values are converted to
+    strings and stripped of surrounding whitespace.
+    """
     if value is None:
         return ""
 
@@ -82,6 +121,7 @@ def normalize_text(
 def normalize_upper_text(
     value: Any,
 ) -> str:
+    """Normalize a scalar value and convert it to uppercase."""
     return normalize_text(
         value
     ).upper()
@@ -107,6 +147,12 @@ def parse_datetime_series(
 def parse_single_datetime(
     value: str | datetime | pd.Timestamp,
 ) -> pd.Timestamp:
+    """
+    Parse one timestamp and normalize it to UTC.
+
+    Raises:
+        ValueError: If the value cannot be interpreted as a timestamp.
+    """
     parsed = pd.to_datetime(
         value,
         errors="coerce",
@@ -126,6 +172,12 @@ def validate_required_columns(
     required_columns: set[str],
     dataset_name: str,
 ) -> None:
+    """
+    Validate the minimum schema and non-empty state of a DataFrame.
+
+    Raises:
+        ValueError: If required columns are missing or the table is empty.
+    """
     missing_columns = (
         required_columns.difference(
             df.columns
@@ -148,6 +200,12 @@ def validate_required_columns(
 def validate_unique_case_ids(
     cases_df: pd.DataFrame,
 ) -> None:
+    """
+    Require one non-empty and unique ``case_id`` per case-level row.
+
+    Raises:
+        ValueError: If an identifier is missing, blank, or duplicated.
+    """
     if cases_df[
         "case_id"
     ].isna().any():
@@ -190,6 +248,12 @@ def validate_dashboard_inputs(
     audit_df: pd.DataFrame,
     priorities_df: pd.DataFrame,
 ) -> None:
+    """
+    Validate all source tables used by the operational dashboard.
+
+    The validation covers required columns, unique case rows, numeric queue
+    fields, and known priority categories.
+    """
     validate_required_columns(
         cases_df,
         REQUIRED_CASE_COLUMNS,
@@ -283,6 +347,12 @@ def find_first_audit_timestamp(
     case_id: str,
     action_types: set[str],
 ) -> pd.Timestamp | pd.NaT:
+    """
+    Return the earliest valid audit timestamp for selected action types.
+
+    Matching is case-insensitive. ``pd.NaT`` is returned when no valid event
+    is available.
+    """
     normalized_actions = {
         normalize_upper_text(
             action
@@ -345,15 +415,14 @@ def find_investigation_start_timestamp(
     current_status: str,
 ) -> tuple[pd.Timestamp | pd.NaT, str]:
     """
-    Busca el primer evento que realmente represente el inicio
-    de la investigación.
+    Reconstruct the first event that represents investigation start.
 
-    Compatibilidad:
-    - acciones explícitas de inicio;
-    - CHANGE_STATUS con una columna de estado destino;
-    - CHANGE_STATUS cuyo detalle menciona EN_INVESTIGACION;
-    - inferencia controlada cuando existe un único cambio de estado
-      para un caso cuyo estado actual es EN_INVESTIGACION.
+    Compatibility is preserved for explicit start actions, destination-status
+    columns, descriptive status-change events, and one conservative fallback
+    used by the current project schema.
+
+    Returns:
+        The earliest start timestamp and a code describing its source.
     """
 
     explicit_timestamp = find_first_audit_timestamp(
@@ -498,10 +567,11 @@ def hours_between(
     end: pd.Timestamp | pd.NaT,
 ) -> float | None:
     """
-    Calcula la diferencia entre dos marcas de tiempo.
+    Calculate elapsed hours between two timestamps.
 
-    Una diferencia negativa se considera una inconsistencia
-    de datos y no se corrige silenciosamente.
+    Missing timestamps return ``None``. A negative duration raises
+    ``ValueError`` because it indicates a source-data inconsistency and must
+    not be hidden with an absolute-value conversion.
     """
 
     if pd.isna(start) or pd.isna(end):
@@ -540,10 +610,10 @@ def determine_sla_status(
     case_closed: bool,
 ) -> str:
     """
-    Determina el cumplimiento del SLA de inicio.
+    Classify compliance with the investigation-start SLA.
 
-    El SLA mide cuánto demoró el caso en comenzar
-    a investigarse desde su creación.
+    Returns one of ``CUMPLIDO``, ``INCUMPLIDO``, ``VENCIDO``,
+    ``EN_PLAZO``, or ``SIN_DATOS``.
     """
 
     if investigation_started:
@@ -572,9 +642,15 @@ def build_operational_dashboard(
     reference_timestamp: str | datetime | pd.Timestamp,
 ) -> pd.DataFrame:
     """
-    Construye una vista operativa de los casos.
+    Build the case-level operational investigation dashboard.
 
-    La función no modifica las tablas originales.
+    Inputs are copied before transformation. The result contains ownership,
+    priority, queue data, reconstructed timestamps, elapsed-time metrics, SLA
+    status, and open/closed indicators.
+
+    Raises:
+        ValueError: If schemas, priorities, identifiers, or timestamps are
+            inconsistent.
     """
 
     validate_dashboard_inputs(
@@ -602,6 +678,8 @@ def build_operational_dashboard(
         .str.strip()
     )
 
+    # Preserve every workflow case. Missing prioritization data receives
+    # explicit conservative defaults below instead of dropping the case.
     dashboard_df = cases.merge(
         priorities[
             [
@@ -971,6 +1049,8 @@ def build_operational_dashboard(
         .fillna(0)
     )
 
+    # Surface open and SLA-problem cases first. Higher priority, score,
+    # and age then determine operational visibility inside those groups.
     result_df = result_df.sort_values(
         by=[
             "is_open",
@@ -1004,7 +1084,10 @@ def build_analyst_workload(
     dashboard_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Resume la carga operacional por analista.
+    Aggregate case workload and timeliness metrics by analyst.
+
+    The result includes total, open, closed, overdue, and status-specific case
+    counts, plus average open-case age and closure time.
     """
 
     required_columns = {
@@ -1189,6 +1272,7 @@ def safe_divide(
     numerator: int | float,
     denominator: int | float,
 ) -> float:
+    """Divide two values while returning zero for a zero denominator."""
     if denominator == 0:
         return 0.0
 
@@ -1201,7 +1285,10 @@ def calculate_operational_kpis(
     dashboard_df: pd.DataFrame,
 ) -> dict[str, Any]:
     """
-    Calcula KPI globales del proceso investigativo.
+    Calculate global operational KPIs for the investigation process.
+
+    SLA compliance includes only completed and measurable start outcomes:
+    ``CUMPLIDO`` and ``INCUMPLIDO``.
     """
 
     required_columns = {
