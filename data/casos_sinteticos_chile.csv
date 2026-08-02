@@ -1,0 +1,13 @@
+﻿case_id,sector,region,scenario,weak_controls,privileged_access,financial_pressure,performance_pressure,rationalization_signal,collusion_signal,high_competence,estimated_loss_clp,detection_delay_days,fraud_type_code
+CL-001,Fintech,Metropolitana,Cuenta nueva recibe múltiples transferencias y retira fondos rápidamente,1,0,1,0,1,1,0,8500000,3,ACCOUNT_TAKEOVER
+CL-002,Municipalidad ficticia,Valparaíso,"Mismo funcionario solicita, aprueba y recepciona compras de proveedor relacionado",1,1,0,1,1,1,1,42000000,210,CORRUPTION
+CL-003,Comercio electrónico,Biobío,Compras con tarjeta desde dispositivo nuevo y entrega a dirección recién creada,1,0,1,0,0,0,0,950000,1,PAYMENT_CARD_FRAUD
+CL-004,Aseguradora,Maule,Siniestro de vehículo declarado pocos días después de contratar la póliza,0,0,1,0,1,0,0,12500000,15,INSURANCE_SOFT_FRAUD
+CL-005,Banco,Antofagasta,Transferencia habitual del cliente dentro de su patrón histórico,0,0,0,0,0,0,0,0,0,FINANCIAL_STATEMENT_FRAUD
+CL-006,Empresa minera ficticia,Antofagasta,Proveedor modifica cuenta bancaria y se paga factura sin doble validación,1,1,0,1,0,0,1,78000000,20,EMBEZZLEMENT
+CL-007,Cooperativa de ahorro,Los Lagos,Empleado ajusta manualmente cuotas vencidas de personas conocidas,1,1,0,0,1,1,0,6900000,120,IDENTITY_THEFT
+CL-008,Retail,Metropolitana,Devoluciones reiteradas sin boleta autorizadas por la misma jefatura,1,1,1,0,1,0,0,3600000,75,PAYMENT_CARD_FRAUD
+CL-009,Empresa de transporte,O'Higgins,"Gasto de combustible aumenta, pero coincide con expansión documentada de rutas",0,0,0,1,0,0,0,0,0,EMBEZZLEMENT
+CL-010,Remesadora ficticia,Arica y Parinacota,Múltiples clientes envían montos similares al mismo beneficiario internacional,1,0,1,0,1,1,1,27000000,30,SYNTHETIC_IDENTITY
+CL-011,Clínica privada ficticia,Metropolitana,Facturación duplicada de prestaciones corregida por control interno,0,1,0,1,0,0,0,0,2,IDENTITY_THEFT
+CL-012,Marketplace,Araucanía,Vendedor nuevo publica productos caros y deriva pagos fuera de la plataforma,1,0,1,0,1,0,1,4800000,8,PHISHING

@@ -1,0 +1,13 @@
+case_id,investigation_outcome,resolved_at,reviewer_id,resolution_summary
+CL-001,CONFIRMADO,2026-08-01T18:00:00-04:00,SUP-001,Se confirmaron inconsistencias documentales y transaccionales.
+CL-002,CONFIRMADO,2026-08-01T18:10:00-04:00,SUP-001,Se confirmó un patrón coordinado de operaciones sospechosas.
+CL-003,DESCARTADO,2026-08-01T18:20:00-04:00,SUP-002,La actividad fue explicada mediante antecedentes adicionales.
+CL-004,CONFIRMADO,2026-08-01T18:30:00-04:00,SUP-002,Se confirmó manipulación del proceso de aprobación.
+CL-005,CONFIRMADO,2026-08-01T18:40:00-04:00,SUP-001,La revisión posterior identificó evidencia no considerada inicialmente.
+CL-006,CONFIRMADO,2026-08-01T18:50:00-04:00,SUP-001,Se confirmó actividad incompatible con el comportamiento histórico.
+CL-007,DESCARTADO,2026-08-01T19:00:00-04:00,SUP-002,El evento correspondía a una operación legítima documentada.
+CL-008,CONFIRMADO,2026-08-01T19:10:00-04:00,SUP-001,Se confirmó utilización irregular de credenciales.
+CL-009,DESCARTADO,2026-08-01T19:20:00-04:00,SUP-002,No se encontraron antecedentes suficientes para confirmar fraude.
+CL-010,CONFIRMADO,2026-08-01T19:30:00-04:00,SUP-001,Se confirmó un patrón de transacciones relacionadas.
+CL-011,DESCARTADO,2026-08-01T19:40:00-04:00,SUP-002,La discrepancia se originó en un error administrativo.
+CL-012,CONFIRMADO,2026-08-01T19:50:00-04:00,SUP-001,Se confirmó una secuencia repetida de actividad irregular.
