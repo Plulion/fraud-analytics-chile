@@ -1,3 +1,31 @@
+"""
+Supervised case closure and feedback generation.
+
+This module implements the controlled transition from an investigated case to
+a formally closed case. It enforces segregation of duties between the assigned
+analyst and the assigned supervisor, preserves a structured resolution record,
+writes append-only audit events, and generates supervised feedback for later
+machine-learning use.
+
+Business rules
+--------------
+- Only supported final outcomes may be approved.
+- The assigned analyst proposes the resolution.
+- The assigned supervisor approves it.
+- Analyst and supervisor must be different people.
+- A discarded case cannot contain a confirmed loss.
+- Recovered value cannot exceed confirmed loss.
+- A case cannot receive a second approved resolution.
+- Closure generates an immutable historical resolution, audit events, and one
+  supervised label.
+
+Interpretation
+--------------
+The generated label is a supervised investigation outcome, not an independent
+proof of fraud. Its quality depends on the investigation, evidence, approval,
+and later lifecycle controls such as reopening and feedback invalidation.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,12 +41,17 @@ CHILE_TIME_ZONE = ZoneInfo(
 )
 
 
+# Final outcomes accepted by the supervised closure workflow.
+# CONFIRMADO maps to the positive label and DESCARTADO to the negative label.
 ALLOWED_FINAL_OUTCOMES = {
     "CONFIRMADO",
     "DESCARTADO",
 }
 
 
+# Cases may be resolved only from active investigative or provisional
+# outcome states. CERRADO is intentionally excluded to prevent duplicate
+# approved resolutions.
 ALLOWED_PRE_CLOSURE_STATUSES = {
     "EN_INVESTIGACION",
     "REQUIERE_ANTECEDENTES",
@@ -85,6 +118,21 @@ REQUIRED_AUDIT_COLUMNS = {
 
 @dataclass(frozen=True)
 class CaseClosureResult:
+    """
+    Immutable container with every table affected by formal case closure.
+
+    Attributes:
+        cases:
+            Updated case registry.
+        resolutions:
+            Resolution registry including the new approved version.
+        audit:
+            Append-only audit registry with proposal, approval, and status
+            transition events.
+        feedback:
+            Supervised feedback registry including the new active label.
+    """
+
     cases: pd.DataFrame
     resolutions: pd.DataFrame
     audit: pd.DataFrame
@@ -92,6 +140,12 @@ class CaseClosureResult:
 
 
 def current_chile_timestamp() -> str:
+    """
+    Return the current Chilean local time as an ISO 8601 string.
+
+    The timezone offset is preserved so later UTC normalization remains
+    deterministic and auditable.
+    """
     return datetime.now(
         CHILE_TIME_ZONE
     ).isoformat(
@@ -102,6 +156,12 @@ def current_chile_timestamp() -> str:
 def normalize_text(
     value: Any,
 ) -> str:
+    """
+    Convert a scalar value into normalized text.
+
+    Missing values become an empty string. Other values are converted to text
+    and stripped of surrounding whitespace.
+    """
     if value is None:
         return ""
 
@@ -117,18 +177,31 @@ def normalize_text(
 def normalize_upper_text(
     value: Any,
 ) -> str:
+    """Normalize a scalar value and convert it to uppercase."""
     return normalize_text(
         value
     ).upper()
 
 
 def create_empty_resolution_registry() -> pd.DataFrame:
+    """
+    Create an empty resolution registry with the canonical schema.
+
+    Returns:
+        A DataFrame containing ``RESOLUTION_COLUMNS`` in stable order.
+    """
     return pd.DataFrame(
         columns=RESOLUTION_COLUMNS
     )
 
 
 def create_empty_feedback_registry() -> pd.DataFrame:
+    """
+    Create an empty supervised-feedback registry with the canonical schema.
+
+    Returns:
+        A DataFrame containing ``FEEDBACK_COLUMNS`` in stable order.
+    """
     return pd.DataFrame(
         columns=FEEDBACK_COLUMNS
     )
@@ -141,11 +214,21 @@ def append_typed_row(
     columns: list[str],
 ) -> pd.DataFrame:
     """
-    Agrega una fila conservando una estructura estable.
+    Append one row while preserving a stable column structure.
 
-    Evita advertencias de pandas cuando el DataFrame
-    original está vacío o contiene columnas totalmente
-    nulas.
+    Constructing the row with the target schema prevents pandas warnings when
+    the original registry is empty or contains all-null columns.
+
+    Args:
+        df:
+            Existing registry.
+        row:
+            Row values to append.
+        columns:
+            Canonical column order for the registry.
+
+    Returns:
+        A new DataFrame containing the appended row.
     """
 
     row_df = pd.DataFrame(
@@ -172,6 +255,12 @@ def validate_required_columns(
     required_columns: set[str],
     dataset_name: str,
 ) -> None:
+    """
+    Validate the minimum schema required by a closure operation.
+
+    Raises:
+        ValueError: If one or more required columns are missing.
+    """
     missing_columns = (
         required_columns.difference(
             df.columns
@@ -192,6 +281,12 @@ def next_sequential_id(
     column: str,
     prefix: str,
 ) -> str:
+    """
+    Generate the next sequential identifier for a registry.
+
+    Existing values that do not match the expected ``PREFIX-######`` pattern
+    are ignored rather than treated as valid sequence members.
+    """
     if df.empty:
         return f"{prefix}-000001"
 
@@ -235,6 +330,12 @@ def parse_nonnegative_amount(
     value: Any,
     field_name: str,
 ) -> float:
+    """
+    Parse a monetary value and require it to be nonnegative.
+
+    Raises:
+        ValueError: If the value is non-numeric or negative.
+    """
     numeric_value = pd.to_numeric(
         value,
         errors="coerce",
@@ -263,6 +364,15 @@ def find_case_row(
     cases_df: pd.DataFrame,
     case_id: str,
 ) -> tuple[int, pd.Series]:
+    """
+    Locate exactly one case in the case registry.
+
+    Returns:
+        A tuple with the DataFrame index and the matching case row.
+
+    Raises:
+        ValueError: If the case is missing or appears more than once.
+    """
     validate_required_columns(
         cases_df,
         REQUIRED_CASE_COLUMNS,
@@ -315,6 +425,12 @@ def append_audit_event(
     comment: str,
     event_timestamp: str,
 ) -> pd.DataFrame:
+    """
+    Append one immutable business event to the audit registry.
+
+    The function allocates a sequential audit identifier and returns a new
+    DataFrame, leaving the caller-owned audit table unchanged.
+    """
     validate_required_columns(
         audit_df,
         REQUIRED_AUDIT_COLUMNS,
@@ -394,6 +510,20 @@ def validate_resolution_request(
     confirmed_loss_clp: Any,
     recovered_amount_clp: Any,
 ) -> tuple[str, float, float]:
+    """
+    Validate authority, outcome, rationale, and monetary closure rules.
+
+    Returns:
+        A tuple containing normalized outcome, confirmed loss, and recovered
+        amount.
+
+    Raises:
+        ValueError:
+            If the case state is not closable, the outcome is unsupported,
+            the proposer or supervisor is unauthorized, segregation of duties
+            is violated, required narrative fields are empty, or monetary
+            values are inconsistent.
+    """
     current_status = normalize_upper_text(
         case_row[
             "investigation_status"
@@ -478,6 +608,8 @@ def validate_resolution_request(
             "supervisor asignado al caso."
         )
 
+    # Segregation of duties: the investigator who proposes the outcome
+    # cannot be the same person who approves and closes the case.
     if normalized_supervisor == normalized_proposer:
         raise ValueError(
             "El analista y el supervisor deben "
@@ -508,12 +640,16 @@ def validate_resolution_request(
         "recovered_amount_clp",
     )
 
+    # Recovery cannot exceed the loss confirmed by the approved
+    # investigation outcome.
     if recovered_amount > confirmed_loss:
         raise ValueError(
             "recovered_amount_clp no puede ser "
             "mayor que confirmed_loss_clp."
         )
 
+    # A discarded investigation represents no confirmed fraud loss in the
+    # supervised label. Nonzero loss would contradict that outcome.
     if (
         normalized_outcome == "DESCARTADO"
         and confirmed_loss != 0
@@ -547,6 +683,51 @@ def close_case_with_supervisor_approval(
     proposed_at: str | None = None,
     approved_at: str | None = None,
 ) -> CaseClosureResult:
+    """
+    Close a case after analyst proposal and supervisor approval.
+
+    The operation is transactional at the function level: it validates all
+    business rules before producing updated copies of the case, resolution,
+    audit, and feedback registries.
+
+    Args:
+        cases_df:
+            Case registry containing one row per case.
+        resolutions_df:
+            Structured resolution history.
+        audit_df:
+            Append-only case audit history.
+        feedback_df:
+            Supervised feedback registry.
+        case_id:
+            Case to close.
+        proposed_outcome:
+            ``CONFIRMADO`` or ``DESCARTADO``.
+        resolution_summary:
+            Concise description of the final conclusion.
+        resolution_rationale:
+            Investigative reasoning supporting the conclusion.
+        proposed_by:
+            Assigned analyst identifier.
+        supervisor_id:
+            Assigned supervisor identifier.
+        confirmed_loss_clp:
+            Confirmed loss in Chilean pesos.
+        recovered_amount_clp:
+            Recovered amount in Chilean pesos.
+        proposed_at:
+            Optional deterministic proposal timestamp for tests or replay.
+        approved_at:
+            Optional deterministic approval timestamp for tests or replay.
+
+    Returns:
+        ``CaseClosureResult`` with all updated registries.
+
+    Raises:
+        ValueError:
+            If schemas, authority, status, outcome, narrative, monetary, or
+            duplicate-resolution rules are violated.
+    """
     validate_required_columns(
         resolutions_df,
         set(
@@ -605,6 +786,8 @@ def close_case_with_supervisor_approval(
         ]
     )
 
+    # Historical proposals may exist, but only one approved resolution is
+    # allowed for a case until a later reopening workflow supersedes it.
     if not previous_resolutions.empty:
         approved_resolutions = (
             previous_resolutions[
@@ -693,6 +876,8 @@ def close_case_with_supervisor_approval(
         columns=RESOLUTION_COLUMNS,
     )
 
+    # Work on copies so validation failures never partially mutate caller
+    # data and successful closure returns an explicit new state.
     updated_cases = cases_df.copy()
 
     text_columns = [
@@ -817,6 +1002,8 @@ def close_case_with_supervisor_approval(
         ),
     )
 
+    # The supervised target is derived from the approved investigation
+    # outcome, never from the original analytical risk score.
     outcome_label = (
         1
         if normalized_outcome
