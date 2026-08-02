@@ -1,3 +1,37 @@
+"""
+Controlled investigation workflow and audit logging.
+
+This module manages the operational lifecycle of fraud investigation cases.
+It initializes case-management records, assigns analysts, applies permitted
+status transitions, stores final resolutions, and appends immutable audit
+events.
+
+Business interpretation
+-----------------------
+The workflow governs operational handling of cases. It does not determine
+whether fraud occurred. Final investigative outcomes remain subject to the
+supervised closure and approval controls implemented in the dedicated closure
+module.
+
+Workflow principles
+-------------------
+- Every case begins in ``NUEVO``.
+- Assignment is allowed only from ``NUEVO``.
+- Investigation cannot start without an assigned analyst.
+- Status changes must follow the configured transition map.
+- ``CONFIRMADO`` and ``DESCARTADO`` require a documented resolution.
+- ``CERRADO`` is reachable only from a final-result state.
+- Every assignment, status change, and resolution update is written to the
+  append-only audit log.
+- Input DataFrames are copied before mutation.
+
+Current limitations
+-------------------
+The transition map is an educational workflow design. Production use would
+require role-based authorization, concurrency controls, persistence-level
+transactions, event integrity checks, and formal approval policies.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,6 +47,7 @@ CHILE_TIME_ZONE = ZoneInfo(
 )
 
 
+# Complete workflow-state catalogue used for normalization and validation.
 INVESTIGATION_STATES = {
     "NUEVO",
     "ASIGNADO",
@@ -25,12 +60,14 @@ INVESTIGATION_STATES = {
 }
 
 
+# Provisional outcomes that require a documented resolution before closure.
 FINAL_RESULT_STATES = {
     "CONFIRMADO",
     "DESCARTADO",
 }
 
 
+# Explicit state machine. Any transition not listed here is rejected.
 ALLOWED_TRANSITIONS = {
     "NUEVO": {
         "ASIGNADO",
@@ -75,8 +112,13 @@ REQUIRED_CASE_COLUMNS = {
 @dataclass(frozen=True)
 class WorkflowResult:
     """
-    Contiene las tablas actualizadas después
-    de una operación de gestión.
+    Immutable container returned by a workflow operation.
+
+    Attributes:
+        cases:
+            Updated case-management table.
+        audit_log:
+            Append-only audit log including the new business events.
     """
 
     cases: pd.DataFrame
@@ -85,8 +127,10 @@ class WorkflowResult:
 
 def current_chile_timestamp() -> str:
     """
-    Devuelve una fecha ISO 8601 utilizando
-    la zona horaria de Chile.
+    Return the current Chilean local time as an ISO 8601 string.
+
+    The timezone offset is retained for traceability and later UTC
+    normalization.
     """
 
     return datetime.now(
@@ -101,7 +145,10 @@ def normalize_required_text(
     field_name: str,
 ) -> str:
     """
-    Normaliza un texto obligatorio.
+    Normalize a required text field.
+
+    Raises:
+        ValueError: If the value is null, missing, or blank.
     """
 
     if value is None:
@@ -134,8 +181,13 @@ def normalize_state(
     state: Any,
 ) -> str:
     """
-    Convierte un estado a mayúsculas y verifica
-    que pertenezca al catálogo.
+    Normalize and validate an investigation state.
+
+    Returns:
+        The uppercase state.
+
+    Raises:
+        ValueError: If the state is missing or outside the workflow catalogue.
     """
 
     normalized = normalize_required_text(
@@ -156,7 +208,10 @@ def validate_case_management_data(
     df: pd.DataFrame,
 ) -> None:
     """
-    Valida la tabla de gestión de casos.
+    Validate the case-management table.
+
+    Validation covers required columns, non-empty input, unique case
+    identifiers, and supported workflow states.
     """
 
     required_columns = {
@@ -224,10 +279,10 @@ def initialize_case_management(
     timestamp: str | None = None,
 ) -> pd.DataFrame:
     """
-    Crea una tabla de gestión a partir de la vista
-    consolidada.
+    Initialize case-management fields from the consolidated case view.
 
-    Todos los casos comienzan en estado NUEVO.
+    Every case starts in ``NUEVO`` with no assigned analyst, no supervisor,
+    no closure timestamp, and no resolution.
     """
 
     missing_columns = (
@@ -262,6 +317,7 @@ def initialize_case_management(
         else current_chile_timestamp()
     )
 
+    # Work on a copy so initialization never mutates the caller source.
     result_df = consolidated_df.copy()
 
     result_df[
@@ -296,9 +352,7 @@ def initialize_case_management(
 
 
 def create_empty_audit_log() -> pd.DataFrame:
-    """
-    Crea una bitácora sin registros.
-    """
+    """Create an empty audit log with the canonical event schema."""
 
     return pd.DataFrame(
         columns=[
@@ -319,11 +373,9 @@ def next_audit_id(
     audit_log: pd.DataFrame,
 ) -> str:
     """
-    Genera identificadores:
+    Generate the next sequential audit identifier.
 
-        AUD-000001
-        AUD-000002
-        ...
+    Existing identifiers must follow the ``AUD-######`` convention.
     """
 
     if audit_log.empty:
@@ -378,9 +430,9 @@ def append_audit_event(
     timestamp: str,
 ) -> pd.DataFrame:
     """
-    Agrega una fila a la bitácora.
+    Append one immutable business event to the audit log.
 
-    La función no modifica registros anteriores.
+    Earlier events are preserved, and a new DataFrame is returned.
     """
 
     new_row = pd.DataFrame(
@@ -423,7 +475,10 @@ def find_case_index(
     case_id: str,
 ) -> int:
     """
-    Localiza una única fila mediante case_id.
+    Locate exactly one case row by ``case_id``.
+
+    Raises:
+        ValueError: If the case is missing or duplicated.
     """
 
     normalized_case_id = (
@@ -465,8 +520,10 @@ def assign_case(
     timestamp: str | None = None,
 ) -> WorkflowResult:
     """
-    Asigna un caso nuevo a un analista y cambia
-    su estado de NUEVO a ASIGNADO.
+    Assign a new case to an analyst and move it to ``ASIGNADO``.
+
+    The operation records the assignment and status transition as separate
+    audit events.
     """
 
     validate_case_management_data(
@@ -501,6 +558,7 @@ def assign_case(
         ]
     )
 
+    # Assignment is allowed only from the initial unowned state.
     if current_status != "NUEVO":
         raise ValueError(
             "Solo se pueden asignar casos "
@@ -579,8 +637,10 @@ def change_investigation_status(
     timestamp: str | None = None,
 ) -> WorkflowResult:
     """
-    Cambia el estado de una investigación y registra
-    la operación en la bitácora.
+    Apply a permitted investigation-status transition.
+
+    Final-result states require a documented resolution, and investigation
+    cannot begin until an analyst is assigned.
     """
 
     validate_case_management_data(
@@ -621,6 +681,7 @@ def change_investigation_status(
         ]
     )
 
+    # Reject workflow shortcuts not declared in the state machine.
     if target_status not in permitted_states:
         raise ValueError(
             "Transición de estado no permitida: "
@@ -634,6 +695,7 @@ def change_investigation_status(
         ]
     ).strip()
 
+    # Active investigation requires an accountable assigned analyst.
     if (
         target_status
         == "EN_INVESTIGACION"
@@ -648,6 +710,7 @@ def change_investigation_status(
         resolution
     ).strip()
 
+    # Final outcomes require an explicit, reviewable resolution narrative.
     if (
         target_status
         in FINAL_RESULT_STATES
