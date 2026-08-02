@@ -1,3 +1,31 @@
+"""
+Investigation notes, evidence preservation, and chain-of-custody records.
+
+This module manages structured investigation notes and file-based evidence.
+It validates that records are attached only to active cases, preserves evidence
+under a case-specific storage path, calculates SHA-256 hashes, and writes
+append-only custody events.
+
+Business interpretation
+-----------------------
+- Notes document analyst observations, analysis, requests, interviews, and
+  decision support.
+- Notes may reference a prior note to preserve a correction or continuation
+  chain without overwriting earlier content.
+- Evidence is copied into controlled storage and verified against the source.
+- SHA-256 is used to detect later changes to stored evidence.
+- Custody events preserve who performed an action, when, where, and against
+  which hash value.
+- Closed cases reject new notes and evidence under the current workflow.
+
+Security and governance considerations
+--------------------------------------
+This educational implementation demonstrates integrity and lineage controls.
+Production use would also require access control, encryption, secure object
+storage, malware scanning, retention policies, legal-hold procedures,
+immutable storage, key management, and stronger transactional guarantees.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -17,6 +45,7 @@ CHILE_TIME_ZONE = ZoneInfo(
 )
 
 
+# Supported semantic categories for investigation notes.
 VALID_NOTE_TYPES = {
     "OBSERVACION",
     "ANALISIS",
@@ -26,6 +55,7 @@ VALID_NOTE_TYPES = {
 }
 
 
+# Lifecycle states available to registered evidence.
 VALID_EVIDENCE_STATUSES = {
     "REGISTRADA",
     "PRESERVADA",
@@ -34,6 +64,7 @@ VALID_EVIDENCE_STATUSES = {
 }
 
 
+# Append-only actions accepted by the evidence chain-of-custody log.
 VALID_CUSTODY_ACTIONS = {
     "REGISTERED",
     "HASH_VERIFIED",
@@ -87,6 +118,18 @@ CUSTODY_COLUMNS = [
 
 @dataclass(frozen=True)
 class EvidenceRegistrationResult:
+    """
+    Immutable result returned after successful evidence registration.
+
+    Attributes:
+        evidence:
+            Updated evidence registry.
+        custody:
+            Updated chain-of-custody log.
+        stored_path:
+            Final path of the preserved evidence copy.
+    """
+
     evidence: pd.DataFrame
     custody: pd.DataFrame
     stored_path: Path
@@ -94,6 +137,22 @@ class EvidenceRegistrationResult:
 
 @dataclass(frozen=True)
 class IntegrityVerificationResult:
+    """
+    Immutable result returned by an evidence-integrity verification.
+
+    Attributes:
+        custody:
+            Updated custody log including the verification event.
+        evidence_id:
+            Verified evidence identifier.
+        expected_hash:
+            Hash stored in the evidence registry.
+        current_hash:
+            Hash calculated from the current stored file.
+        integrity_ok:
+            Whether both hashes match.
+    """
+
     custody: pd.DataFrame
     evidence_id: str
     expected_hash: str
@@ -102,6 +161,11 @@ class IntegrityVerificationResult:
 
 
 def current_chile_timestamp() -> str:
+    """
+    Return the current Chilean local time as an ISO 8601 string.
+
+    The timezone offset is retained for auditability and later normalization.
+    """
     return datetime.now(
         CHILE_TIME_ZONE
     ).isoformat(
@@ -112,6 +176,12 @@ def current_chile_timestamp() -> str:
 def normalize_text(
     value: Any,
 ) -> str:
+    """
+    Convert a scalar value into normalized text.
+
+    Missing values become an empty string. Other values are converted to text
+    and stripped of surrounding whitespace.
+    """
     if value is None:
         return ""
 
@@ -127,24 +197,28 @@ def normalize_text(
 def normalize_upper_text(
     value: Any,
 ) -> str:
+    """Normalize a scalar value and convert it to uppercase."""
     return normalize_text(
         value
     ).upper()
 
 
 def create_empty_notes() -> pd.DataFrame:
+    """Create an empty investigation-note registry with stable schema."""
     return pd.DataFrame(
         columns=NOTE_COLUMNS
     )
 
 
 def create_empty_evidence_registry() -> pd.DataFrame:
+    """Create an empty evidence registry with stable schema."""
     return pd.DataFrame(
         columns=EVIDENCE_COLUMNS
     )
 
 
 def create_empty_custody_log() -> pd.DataFrame:
+    """Create an empty chain-of-custody log with stable schema."""
     return pd.DataFrame(
         columns=CUSTODY_COLUMNS
     )
@@ -156,6 +230,12 @@ def next_sequential_id(
     column: str,
     prefix: str,
 ) -> str:
+    """
+    Generate the next sequential identifier for a registry.
+
+    Existing values outside the expected ``PREFIX-######`` pattern are ignored
+    when determining the next sequence number.
+    """
     if df.empty:
         return f"{prefix}-000001"
 
@@ -200,10 +280,18 @@ def validate_case_available(
     case_id: str,
 ) -> pd.Series:
     """
-    Comprueba que el caso exista y que no esté cerrado.
+    Require one existing case that is still open for new records.
 
-    Acepta distintos nombres de columna para el estado
-    del caso, incluyendo investigation_status.
+    Multiple recognized status-column names are supported for compatibility
+    with earlier project schemas.
+
+    Returns:
+        The unique matching case row.
+
+    Raises:
+        ValueError:
+            If the case table lacks a recognized schema, the case is missing or
+            duplicated, its status is empty, or it is already closed.
     """
 
     if "case_id" not in cases_df.columns:
@@ -275,6 +363,8 @@ def validate_case_available(
             f"{normalized_case_id}"
         )
 
+    # The current workflow freezes documentary additions after closure.
+    # Reopening must occur before new notes or evidence can be registered.
     if case_status == "CERRADO":
         raise ValueError(
             "No se pueden agregar registros "
@@ -296,6 +386,17 @@ def add_investigation_note(
     previous_note_id: str = "",
     created_at: str | None = None,
 ) -> pd.DataFrame:
+    """
+    Append one structured note to an active investigation case.
+
+    ``previous_note_id`` may link a continuation or correction to an earlier
+    note without modifying the historical record.
+
+    Raises:
+        ValueError:
+            If the case is unavailable, author or content is missing, the note
+            type is unsupported, or the referenced previous note is invalid.
+    """
     validate_case_available(
         cases_df,
         case_id,
@@ -335,6 +436,8 @@ def add_investigation_note(
             "La nota no puede estar vacía."
         )
 
+    # Prior-note linkage preserves chronology without overwriting or deleting
+    # the earlier note.
     if normalized_previous:
         if notes_df.empty:
             raise ValueError(
@@ -409,6 +512,16 @@ def add_investigation_note(
 def hash_file_sha256(
     file_path: Path,
 ) -> str:
+    """
+    Calculate the SHA-256 digest of a file using streaming reads.
+
+    Reading in one-megabyte chunks avoids loading large evidence files entirely
+    into memory.
+
+    Raises:
+        FileNotFoundError: If the path does not exist.
+        ValueError: If the path is not a regular file.
+    """
     path = Path(
         file_path
     )
@@ -455,6 +568,13 @@ def append_custody_event(
     sha256: str,
     event_timestamp: str | None = None,
 ) -> pd.DataFrame:
+    """
+    Append one immutable event to the evidence chain-of-custody log.
+
+    Raises:
+        ValueError:
+            If the action is unsupported or the actor identifier is missing.
+    """
     normalized_action = (
         normalize_upper_text(
             action_type
@@ -536,6 +656,25 @@ def register_evidence(
     collected_by: str,
     collected_at: str | None = None,
 ) -> EvidenceRegistrationResult:
+    """
+    Preserve one evidence file and create its custody history.
+
+    The source file is hashed, copied into case-specific storage, hashed again,
+    and accepted only when both digests match.
+
+    Returns:
+        ``EvidenceRegistrationResult`` containing updated registries and the
+        final stored path.
+
+    Raises:
+        FileNotFoundError:
+            If the source file does not exist.
+        ValueError:
+            If the case is unavailable, the source is not a non-empty file, or
+            required collection metadata is missing.
+        RuntimeError:
+            If the copied file hash differs from the source hash.
+    """
     validate_case_available(
         cases_df,
         case_id,
@@ -608,6 +747,8 @@ def register_evidence(
         / stored_filename
     )
 
+    # Hash the source before copying so the preserved file can be compared
+    # against the exact bytes initially collected.
     source_hash = hash_file_sha256(
         source
     )
@@ -621,6 +762,7 @@ def register_evidence(
         stored_path
     )
 
+    # Remove the incomplete preservation directory if copy integrity fails.
     if source_hash != stored_hash:
         shutil.rmtree(
             evidence_directory,
@@ -743,6 +885,21 @@ def verify_evidence_integrity(
     comment: str = "",
     event_timestamp: str | None = None,
 ) -> IntegrityVerificationResult:
+    """
+    Recalculate a stored evidence hash and record the integrity result.
+
+    A matching hash writes ``HASH_VERIFIED``. A mismatch writes
+    ``INTEGRITY_MISMATCH`` while preserving both expected and current hashes.
+
+    Returns:
+        ``IntegrityVerificationResult`` with the updated custody log.
+
+    Raises:
+        ValueError:
+            If the evidence identifier is missing or duplicated.
+        FileNotFoundError:
+            If the registered storage path no longer exists.
+    """
     matches = evidence_df.loc[
         evidence_df["evidence_id"]
         .astype(str)
@@ -781,6 +938,8 @@ def verify_evidence_integrity(
         stored_path
     )
 
+    # Integrity is based on byte-level equality of the registered and current
+    # SHA-256 digests, not on filename or metadata equality.
     integrity_ok = (
         current_hash
         == expected_hash
