@@ -1,3 +1,41 @@
+"""
+Capacity-aware investigation prioritization.
+
+This module combines alerts, analytical assessment context, and consolidated
+case information to produce an explainable investigation queue.
+
+Business interpretation
+-----------------------
+The priority score is an operational triage aid. It does not determine whether
+fraud occurred and does not replace investigator judgment.
+
+The score currently combines:
+
+- analytical risk level;
+- estimated financial loss;
+- recurrence of digital activity;
+- assessment coverage.
+
+The queue is then ordered and split into ``SELECCIONADA`` and ``EN_ESPERA``
+according to available investigation capacity. Alerts are never deleted or
+silently discarded.
+
+Governance principles
+---------------------
+- Every component score is preserved.
+- Human-readable reason codes explain the priority.
+- Queue position is deterministic under the current sort order.
+- Capacity policy ID and version are stored with every output row.
+- Missing joins or invalid source values stop processing instead of producing
+  incomplete priorities.
+
+Current limitations
+-------------------
+The scoring thresholds are educational configuration values. Production use
+would require empirical calibration, cost analysis, fairness review, capacity
+testing, and periodic monitoring.
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -41,6 +79,7 @@ VALID_RISK_LEVELS = {
 }
 
 
+# Educational point allocation for analytical risk level.
 RISK_POINTS = {
     "CRITICO": 40,
     "ALTO": 30,
@@ -51,6 +90,7 @@ RISK_POINTS = {
 }
 
 
+# Sorting rank used after the numeric priority score is classified.
 PRIORITY_RANK = {
     "CRITICA": 4,
     "ALTA": 3,
@@ -61,6 +101,13 @@ PRIORITY_RANK = {
 
 @dataclass(frozen=True)
 class InvestigationPriorityRecord:
+    """
+    Explainable and versioned investigation-queue record.
+
+    The record preserves every scoring component, the resulting priority,
+    explanatory reason codes, queue position, capacity status, and policy
+    version used to create it.
+    """
     alert_id: str
     assessment_id: str
     case_id: str
@@ -85,6 +132,12 @@ class InvestigationPriorityRecord:
 def normalize_text(
     value: Any,
 ) -> str:
+    """
+    Convert a scalar value into normalized text.
+
+    Missing values become an empty string. Other values are converted to text
+    and stripped of surrounding whitespace.
+    """
     if value is None:
         return ""
 
@@ -100,6 +153,7 @@ def normalize_text(
 def normalize_upper_text(
     value: Any,
 ) -> str:
+    """Normalize a scalar value and convert it to uppercase."""
     return normalize_text(
         value
     ).upper()
@@ -110,6 +164,13 @@ def validate_unique_non_empty_identifier(
     column: str,
     dataset_name: str,
 ) -> None:
+    """
+    Require a non-empty and unique identifier column.
+
+    Raises:
+        ValueError: If the identifier contains null, blank, or duplicate
+            values.
+    """
     if df[column].isna().any():
         raise ValueError(
             f"{dataset_name} contiene valores "
@@ -154,6 +215,17 @@ def validate_prioritization_inputs(
     assessments_df: pd.DataFrame,
     consolidated_df: pd.DataFrame,
 ) -> None:
+    """
+    Validate all source tables used to prioritize investigations.
+
+    Validation covers required schemas, non-empty inputs, unique identifiers,
+    numeric ranges, nonnegative values, and supported risk levels.
+
+    Raises:
+        ValueError:
+            If any source is malformed, empty, duplicated, or contains invalid
+            values.
+    """
     missing_alert_columns = (
         REQUIRED_ALERT_COLUMNS.difference(
             alerts_df.columns
@@ -302,6 +374,12 @@ def validate_prioritization_inputs(
 def calculate_loss_points(
     estimated_loss_clp: float,
 ) -> int:
+    """
+    Convert estimated financial exposure into priority points.
+
+    Thresholds are educational policy values and require calibration before
+    production use.
+    """
     if estimated_loss_clp >= 50_000_000:
         return 25
 
@@ -317,6 +395,11 @@ def calculate_loss_points(
 def calculate_recurrence_points(
     digital_event_count: int,
 ) -> int:
+    """
+    Convert repeated digital activity into recurrence points.
+
+    More observed events increase operational urgency under the current policy.
+    """
     if digital_event_count >= 4:
         return 15
 
@@ -332,6 +415,12 @@ def calculate_recurrence_points(
 def calculate_coverage_points(
     assessment_coverage: float,
 ) -> int:
+    """
+    Convert assessment coverage into prioritization points.
+
+    Higher coverage receives more points because the current policy gives
+    greater operational confidence to more complete assessments.
+    """
     if assessment_coverage >= 90:
         return 10
 
@@ -344,6 +433,12 @@ def calculate_coverage_points(
 def classify_investigation_priority(
     priority_score: int,
 ) -> str:
+    """
+    Map a numeric priority score to an investigation-priority category.
+
+    Returns:
+        ``CRITICA``, ``ALTA``, ``MEDIA``, or ``BAJA``.
+    """
     if priority_score >= 75:
         return "CRITICA"
 
@@ -364,6 +459,12 @@ def build_priority_reasons(
     assessment_coverage: float,
     data_quality_status: str,
 ) -> str:
+    """
+    Build machine-readable explanations for an investigation priority.
+
+    Returns:
+        A pipe-delimited string containing the main drivers of the score.
+    """
     reasons = [
         f"RISK_LEVEL_{risk_level}",
     ]
@@ -439,10 +540,33 @@ def prioritize_investigations(
     capacity_policy_version: str = "1.0.0",
 ) -> pd.DataFrame:
     """
-    Construye una cola priorizada y selecciona
-    las primeras alertas según la capacidad.
+    Build an explainable queue and apply an investigation-capacity limit.
 
-    No elimina ni descarta alertas.
+    Every alert receives a priority score and queue position. The first rows up
+    to ``investigation_capacity`` are marked ``SELECCIONADA``; all remaining
+    alerts stay visible as ``EN_ESPERA``.
+
+    Args:
+        alerts_df:
+            Operational alerts to prioritize.
+        assessments_df:
+            Assessment coverage and data-quality context.
+        consolidated_df:
+            Consolidated case information including digital-event recurrence.
+        investigation_capacity:
+            Maximum number of alerts selected for immediate investigation.
+        capacity_policy_id:
+            Identifier of the capacity policy.
+        capacity_policy_version:
+            Version of the capacity policy.
+
+    Returns:
+        A stable DataFrame of ``InvestigationPriorityRecord`` rows.
+
+    Raises:
+        ValueError:
+            If schemas, source values, joins, risk levels, or capacity are
+            invalid.
     """
 
     validate_prioritization_inputs(
@@ -556,6 +680,8 @@ def prioritize_investigations(
         dict[str, Any]
     ] = []
 
+    # Each component remains explicit so reviewers can reproduce and
+    # challenge the final priority score.
     for _, row in joined_df.iterrows():
         risk_level = normalize_upper_text(
             row["risk_level"]
@@ -678,6 +804,8 @@ def prioritize_investigations(
         temporary_rows
     )
 
+    # Deterministic ordering first uses priority category and score, then
+    # exposure, coverage, alert age, and identifier as tie-breakers.
     queue_df = queue_df.sort_values(
         by=[
             "_priority_rank",
@@ -702,6 +830,8 @@ def prioritize_investigations(
     for position, row in queue_df.iterrows():
         queue_position = position + 1
 
+        # Capacity changes operational status only; it never removes an alert
+        # from the queue or changes the underlying risk assessment.
         queue_status = (
             "SELECCIONADA"
             if queue_position
