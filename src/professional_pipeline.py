@@ -1,3 +1,34 @@
+"""
+Professional assessment and alert-generation pipeline.
+
+This module converts one consolidated case-level risk view into two governed
+outputs:
+
+- one reproducible analytical assessment per case;
+- zero or one alert per case, according to the active selection policy.
+
+Business interpretation
+-----------------------
+An assessment is an analytical record, not a finding of guilt, fraud, or legal
+responsibility. An alert is an operational selection decision indicating that a
+case should receive attention under the current policy.
+
+Governance principles
+---------------------
+- Every assessment records engine, policy, and schema versions.
+- Every alert records the selection-policy version that created it.
+- Alert creation is separated from risk-score calculation.
+- Data-quality concerns may independently trigger operational review.
+- Identifiers and timestamps can be injected for deterministic testing.
+- Alerts are prioritized for workflow visibility, not as proof of fraud.
+
+Current limitations
+-------------------
+The current policy is rule-based and educational. It does not yet implement
+capacity constraints, cost-sensitive optimization, threshold calibration,
+fairness testing, drift monitoring, or production approval workflows.
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -27,6 +58,7 @@ REQUIRED_CONSOLIDATED_COLUMNS = {
 }
 
 
+# Alert levels accepted from the consolidated analytical layer.
 VALID_ALERT_LEVELS = {
     "BAJO",
     "MEDIO",
@@ -37,6 +69,7 @@ VALID_ALERT_LEVELS = {
 }
 
 
+# Operational queue priorities created by the alert-selection policy.
 VALID_ALERT_PRIORITIES = {
     "BAJA",
     "MEDIA",
@@ -48,10 +81,14 @@ VALID_ALERT_PRIORITIES = {
 @dataclass(frozen=True)
 class AssessmentRecord:
     """
-    Resultado reproducible de un motor analítico.
+    Reproducible output of one analytical engine execution.
 
-    No representa culpabilidad ni una decisión
-    judicial o administrativa.
+    The record preserves the case, engine, policy, schema, timestamp, score,
+    coverage, recommendation, and data-quality context required for later
+    audit and backtesting.
+
+    It does not represent guilt or a judicial, administrative, or final
+    investigative decision.
     """
 
     assessment_id: str
@@ -72,8 +109,10 @@ class AssessmentRecord:
 @dataclass(frozen=True)
 class AlertRecord:
     """
-    Registro creado cuando una evaluación cumple
-    una política de selección.
+    Operational alert created when an assessment satisfies selection policy.
+
+    The record preserves the originating assessment and the exact policy
+    version responsible for alert creation.
     """
 
     alert_id: str
@@ -92,7 +131,10 @@ class AlertRecord:
 @dataclass(frozen=True)
 class AlertSelectionDecision:
     """
-    Resultado interno de la política de selección.
+    Internal result returned by the alert-selection policy.
+
+    ``should_create_alert`` separates policy evaluation from persistence of the
+    final alert record.
     """
 
     should_create_alert: bool
@@ -103,7 +145,13 @@ class AlertSelectionDecision:
 @dataclass(frozen=True)
 class ProfessionalPipelineResult:
     """
-    Contiene las evaluaciones y alertas producidas.
+    Immutable container with assessments and alerts produced by one run.
+
+    Attributes:
+        assessments:
+            One versioned assessment per input case.
+        alerts:
+            Only the cases selected by the active alert policy.
     """
 
     assessments: pd.DataFrame
@@ -112,7 +160,10 @@ class ProfessionalPipelineResult:
 
 def current_chile_timestamp() -> str:
     """
-    Devuelve fecha y hora ISO 8601 para Chile.
+    Return the current Chilean local time as an ISO 8601 string.
+
+    The timezone offset is retained for auditability and later UTC
+    normalization.
     """
 
     return datetime.now(
@@ -123,9 +174,7 @@ def current_chile_timestamp() -> str:
 
 
 def generate_assessment_id() -> str:
-    """
-    Genera un identificador técnico único.
-    """
+    """Generate a globally unique technical assessment identifier."""
 
     return (
         "ASM-"
@@ -134,9 +183,7 @@ def generate_assessment_id() -> str:
 
 
 def generate_alert_id() -> str:
-    """
-    Genera un identificador único de alerta.
-    """
+    """Generate a globally unique technical alert identifier."""
 
     return (
         "ALT-"
@@ -148,7 +195,10 @@ def normalize_text(
     value: Any,
 ) -> str:
     """
-    Convierte un valor a texto normalizado.
+    Convert a scalar value into normalized text.
+
+    Missing values become an empty string. Other values are converted to text
+    and stripped of surrounding whitespace.
     """
 
     if value is None:
@@ -166,6 +216,7 @@ def normalize_text(
 def normalize_upper_text(
     value: Any,
 ) -> str:
+    """Normalize a scalar value and convert it to uppercase."""
     return normalize_text(
         value
     ).upper()
@@ -175,8 +226,15 @@ def validate_consolidated_input(
     df: pd.DataFrame,
 ) -> None:
     """
-    Valida la vista consolidada antes de crear
-    evaluaciones profesionales.
+    Validate the consolidated case view before assessment generation.
+
+    Validation covers required columns, non-empty input, unique case IDs,
+    numeric and nonnegative analytical values, and supported alert levels.
+
+    Raises:
+        ValueError:
+            If the consolidated view is empty, malformed, duplicated, or
+            contains unsupported or invalid values.
     """
 
     missing_columns = (
@@ -311,8 +369,28 @@ def create_assessment_record(
     input_schema_version: str = "1.0.0",
 ) -> AssessmentRecord:
     """
-    Transforma una fila consolidada en una
-    evaluación versionada.
+    Transform one consolidated case row into a versioned assessment.
+
+    Args:
+        row:
+            One validated consolidated case record.
+        assessment_id:
+            Unique assessment identifier.
+        evaluated_at:
+            Timestamp shared by the pipeline run.
+        engine_type:
+            Analytical engine family.
+        engine_version:
+            Executed engine version.
+        policy_id:
+            Risk-policy identifier.
+        policy_version:
+            Risk-policy version.
+        input_schema_version:
+            Version of the input contract.
+
+    Returns:
+        A frozen ``AssessmentRecord`` suitable for audit and backtesting.
     """
 
     case_id = normalize_text(
@@ -374,14 +452,14 @@ def select_alert(
     assessment: AssessmentRecord,
 ) -> AlertSelectionDecision:
     """
-    Decide si una evaluación debe generar
-    una alerta.
+    Decide whether an assessment should create an operational alert.
 
-    Esta política inicial considera el nivel
-    consolidado y la calidad de los datos.
+    The initial policy considers consolidated risk level and data-quality
+    status. Estimated loss is preserved in the final alert and used for queue
+    ordering, but it does not yet alter the selection decision itself.
 
-    La pérdida económica se utilizará en la
-    siguiente revisión para priorización avanzada.
+    Returns:
+        An ``AlertSelectionDecision`` with creation flag, priority, and reason.
     """
 
     risk_level = (
@@ -392,6 +470,9 @@ def select_alert(
         assessment.data_quality_status
     )
 
+    # Data-quality issues trigger human review independently of the numeric
+    # risk level because incomplete or inconsistent inputs can make the
+    # analytical conclusion unreliable.
     if data_status == (
         "REQUIERE_REVISION_DE_DATOS"
     ):
@@ -467,10 +548,12 @@ def create_alert_record(
     selection_policy_version: str = "1.0.0",
 ) -> AlertRecord:
     """
-    Crea una alerta desde una evaluación.
+    Create a versioned alert from a positive selection decision.
 
-    Solo debe llamarse cuando la política haya
-    indicado que corresponde crearla.
+    Raises:
+        ValueError:
+            If policy did not select the assessment or returned an unsupported
+            alert priority.
     """
 
     if not decision.should_create_alert:
@@ -522,10 +605,10 @@ def records_to_dataframe(
     columns: list[str],
 ) -> pd.DataFrame:
     """
-    Convierte dataclasses en DataFrame.
+    Convert dataclass records into a DataFrame with stable schema.
 
-    columns garantiza una estructura estable
-    incluso cuando no existen alertas.
+    Supplying explicit columns preserves the expected output contract even
+    when the record collection is empty.
     """
 
     rows = [
@@ -553,8 +636,29 @@ def process_professional_pipeline(
     ] = generate_alert_id,
 ) -> ProfessionalPipelineResult:
     """
-    Crea una evaluación para cada caso y una
-    alerta solo cuando la política lo determine.
+    Run the professional assessment and alert-selection pipeline.
+
+    One assessment is created for every validated case. An alert is created
+    only when the active selection policy returns a positive decision.
+
+    Args:
+        consolidated_df:
+            One-row-per-case consolidated analytical view.
+        timestamp:
+            Optional deterministic timestamp for tests or replay.
+        assessment_id_factory:
+            Injectable assessment-ID generator.
+        alert_id_factory:
+            Injectable alert-ID generator.
+
+    Returns:
+        ``ProfessionalPipelineResult`` containing stable assessment and alert
+        DataFrames.
+
+    Raises:
+        ValueError:
+            If the consolidated input or any generated alert decision is
+            invalid.
     """
 
     validate_consolidated_input(
@@ -575,6 +679,9 @@ def process_professional_pipeline(
         AlertRecord
     ] = []
 
+    # Assessment creation is unconditional for valid input rows. Alert
+    # creation is a separate policy decision, preserving all analytical
+    # outcomes for later audit and backtesting.
     for _, row in consolidated_df.iterrows():
         assessment = (
             create_assessment_record(
@@ -652,6 +759,8 @@ def process_professional_pipeline(
         "BAJA": 1,
     }
 
+    # Queue ordering gives operational visibility to higher priority and
+    # larger estimated loss. It does not change the underlying assessment.
     if not alerts_df.empty:
         alerts_df[
             "_priority_rank"
