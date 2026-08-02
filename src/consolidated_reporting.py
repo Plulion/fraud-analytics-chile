@@ -1,3 +1,37 @@
+"""
+Consolidated fraud reporting and visualization.
+
+This module transforms the one-row-per-case consolidated analytical view into
+summary metrics and static charts suitable for operational review.
+
+Business interpretation
+-----------------------
+The reports describe portfolio composition and analytical signals. They do not
+confirm fraud, replace case investigation, or authorize operational actions.
+
+Outputs
+-------
+- JSON-compatible summary metrics;
+- case counts by consolidated alert level;
+- comparison of general risk score and maximum observed digital risk score.
+
+Governance principles
+---------------------
+- Required columns are validated before reporting.
+- Empty consolidated views are rejected.
+- Summary values are explicitly converted to standard Python types.
+- Charts use deterministic category ordering.
+- Missing digital risk is represented as zero only for visualization and may
+  indicate that no digital events were available.
+- Output directories are created without altering the source DataFrame.
+
+Current limitations
+-------------------
+This educational reporting layer does not yet include interactive dashboards,
+role-based access, report versioning, data masking, confidence intervals,
+drill-down controls, or automated distribution.
+"""
+
 from __future__ import annotations
 
 import json
@@ -29,6 +63,13 @@ REQUIRED_CONSOLIDATED_COLUMNS = {
 def validate_consolidated_data(
     df: pd.DataFrame,
 ) -> None:
+    """
+    Validate the consolidated case view required by reporting functions.
+
+    Raises:
+        ValueError:
+            If required columns are missing or the DataFrame is empty.
+    """
     missing_columns = (
         REQUIRED_CONSOLIDATED_COLUMNS
         .difference(df.columns)
@@ -51,17 +92,25 @@ def build_consolidated_summary(
     df: pd.DataFrame,
 ) -> dict[str, Any]:
     """
-    Construye las métricas de la vista consolidada.
+    Build JSON-compatible metrics from the consolidated case view.
+
+    Returns:
+        A dictionary containing case counts, digital-event coverage, alert
+        distribution, data-review volume, and estimated loss for cases with
+        digital activity.
     """
 
     validate_consolidated_data(df)
 
+    # Preserve the complete alert distribution for portfolio-level review.
     alert_counts = (
         df["consolidated_alert_level"]
         .value_counts()
         .to_dict()
     )
 
+    # Estimated loss for digitally observed cases is separated from the
+    # overall portfolio to avoid implying digital coverage where none exists.
     cases_with_events = df[
         df["has_digital_events"]
     ]
@@ -124,6 +173,11 @@ def save_consolidated_summary_json(
     summary: dict[str, Any],
     output_path: Path,
 ) -> None:
+    """
+    Persist a consolidated summary as UTF-8 formatted JSON.
+
+    Parent directories are created when necessary.
+    """
     output_path.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -146,12 +200,16 @@ def generate_consolidated_alert_chart(
     output_path: Path,
 ) -> None:
     """
-    Genera un gráfico de casos según la alerta
-    consolidada.
+    Generate a bar chart of cases by consolidated alert level.
+
+    Categories are reindexed to a fixed business order so absent alert levels
+    remain visible with a zero count.
     """
 
     validate_consolidated_data(df)
 
+    # Fixed ordering keeps charts comparable across reporting periods even
+    # when one or more alert categories are absent.
     alert_order = [
         "CRITICO",
         "ALTO",
@@ -209,11 +267,10 @@ def generate_risk_comparison_chart(
     output_path: Path,
 ) -> None:
     """
-    Compara el puntaje general con el máximo
-    puntaje digital observado en cada caso.
+    Compare general risk with maximum observed digital risk by case.
 
-    Un valor digital igual a cero en el gráfico puede
-    significar que no había eventos digitales.
+    A displayed digital value of zero may mean that no digital events were
+    available. It must not automatically be interpreted as zero digital risk.
     """
 
     validate_consolidated_data(df)
@@ -226,6 +283,8 @@ def generate_risk_comparison_chart(
         ]
     ].copy()
 
+    # Zero is a plotting default for missing digital scores. It does not prove
+    # that a digital assessment found no risk.
     comparison[
         "digital_risk_score_max"
     ] = (
@@ -290,8 +349,16 @@ def generate_consolidated_reports(
     df: pd.DataFrame,
     output_directory: Path,
 ) -> list[Path]:
+    """
+    Generate all static charts for the consolidated reporting package.
+
+    Returns:
+        Paths of the generated chart files in deterministic order.
+    """
     validate_consolidated_data(df)
 
+    # Report generation writes only to the requested output directory and
+    # never mutates the consolidated input DataFrame.
     output_directory.mkdir(
         parents=True,
         exist_ok=True,
