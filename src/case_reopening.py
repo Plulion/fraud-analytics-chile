@@ -1,3 +1,28 @@
+"""
+Controlled reopening of previously closed fraud investigation cases.
+
+This module reactivates a closed case under supervisor authority while
+preserving the historical resolution and invalidating the supervised feedback
+that was derived from it.
+
+Business rules
+--------------
+- Only a case in ``CERRADO`` status may be reopened.
+- Only the assigned supervisor may authorize reopening.
+- A documented reason of at least 20 characters is required.
+- The target status must return the case to active investigation.
+- The latest approved resolution is preserved and marked as superseded.
+- The feedback linked to that resolution is preserved and marked invalid.
+- Reopening writes append-only audit events.
+- Invalidated feedback must not be used for later model training.
+
+Interpretation
+--------------
+Reopening does not erase the previous investigation outcome. It records that
+the prior conclusion is no longer active because the investigation has resumed.
+This preserves lineage, auditability, and model-training integrity.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,6 +38,8 @@ CHILE_TIME_ZONE = ZoneInfo(
 )
 
 
+# Reopening must return the case to an active investigative state.
+# Final outcome and closed states are intentionally excluded.
 ALLOWED_REOPEN_STATUSES = {
     "EN_INVESTIGACION",
     "REQUIERE_ANTECEDENTES",
@@ -65,6 +92,8 @@ REQUIRED_FEEDBACK_COLUMNS = {
 }
 
 
+# Lifecycle fields preserve the approved resolution as historical evidence
+# while clearly marking that it is no longer the active conclusion.
 RESOLUTION_LIFECYCLE_COLUMNS = {
     "resolution_lifecycle_status": "VIGENTE",
     "superseded_at": "",
@@ -73,6 +102,8 @@ RESOLUTION_LIFECYCLE_COLUMNS = {
 }
 
 
+# Feedback lifecycle fields prevent a superseded investigation outcome
+# from contaminating supervised model-training data.
 FEEDBACK_LIFECYCLE_COLUMNS = {
     "feedback_status": "ACTIVO",
     "invalidated_at": "",
@@ -83,6 +114,22 @@ FEEDBACK_LIFECYCLE_COLUMNS = {
 
 @dataclass(frozen=True)
 class CaseReopeningResult:
+    """
+    Immutable container with every registry affected by case reopening.
+
+    Attributes:
+        cases:
+            Updated case registry with the case returned to investigation.
+        resolutions:
+            Resolution history with the previous approved resolution marked
+            as superseded.
+        audit:
+            Append-only audit history including reopening, invalidation, and
+            status-change events.
+        feedback:
+            Feedback registry with the previous label marked invalid.
+    """
+
     cases: pd.DataFrame
     resolutions: pd.DataFrame
     audit: pd.DataFrame
@@ -90,6 +137,11 @@ class CaseReopeningResult:
 
 
 def current_chile_timestamp() -> str:
+    """
+    Return the current Chilean local time as an ISO 8601 string.
+
+    The timezone offset is preserved for later normalization and audit review.
+    """
     return datetime.now(
         CHILE_TIME_ZONE
     ).isoformat(
@@ -100,6 +152,12 @@ def current_chile_timestamp() -> str:
 def normalize_text(
     value: Any,
 ) -> str:
+    """
+    Convert a scalar value into normalized text.
+
+    Missing values become an empty string. Other values are converted to text
+    and stripped of surrounding whitespace.
+    """
     if value is None:
         return ""
 
@@ -115,6 +173,7 @@ def normalize_text(
 def normalize_upper_text(
     value: Any,
 ) -> str:
+    """Normalize a scalar value and convert it to uppercase."""
     return normalize_text(
         value
     ).upper()
@@ -125,6 +184,12 @@ def validate_required_columns(
     required_columns: set[str],
     dataset_name: str,
 ) -> None:
+    """
+    Validate the minimum schema required by a reopening operation.
+
+    Raises:
+        ValueError: If one or more required columns are missing.
+    """
     missing_columns = (
         required_columns.difference(
             df.columns
@@ -143,6 +208,15 @@ def ensure_text_columns(
     df: pd.DataFrame,
     defaults: dict[str, str],
 ) -> pd.DataFrame:
+    """
+    Add lifecycle columns when missing and normalize them as text.
+
+    This helper keeps backward compatibility with registries produced before
+    lifecycle fields were introduced.
+
+    Returns:
+        A copied DataFrame with all requested columns initialized.
+    """
     result = df.copy()
 
     for column, default_value in defaults.items():
@@ -176,6 +250,12 @@ def next_sequential_id(
     column: str,
     prefix: str,
 ) -> str:
+    """
+    Generate the next sequential identifier for a registry.
+
+    Values that do not match the expected ``PREFIX-######`` pattern are
+    ignored when determining the next sequence number.
+    """
     if column not in df.columns:
         raise ValueError(
             f"No existe la columna {column!r}."
@@ -221,6 +301,12 @@ def append_audit_event(
     comment: str,
     event_timestamp: str,
 ) -> pd.DataFrame:
+    """
+    Append one immutable business event to the audit registry.
+
+    The function returns a new DataFrame and leaves the caller-owned audit
+    history unchanged.
+    """
     validate_required_columns(
         audit_df,
         REQUIRED_AUDIT_COLUMNS,
@@ -291,6 +377,15 @@ def find_single_case(
     cases_df: pd.DataFrame,
     case_id: str,
 ) -> tuple[Any, pd.Series]:
+    """
+    Locate exactly one case in the case registry.
+
+    Returns:
+        A tuple containing the DataFrame index and matching row.
+
+    Raises:
+        ValueError: If the case is missing or duplicated.
+    """
     normalized_case_id = normalize_text(
         case_id
     )
@@ -327,6 +422,18 @@ def find_latest_approved_resolution(
     *,
     case_id: str,
 ) -> tuple[Any, pd.Series]:
+    """
+    Locate the most recent approved resolution for a case.
+
+    The approval timestamp is used when valid. If all timestamps are invalid,
+    the last matching row is selected as a conservative compatibility fallback.
+
+    Returns:
+        A tuple containing the resolution-row index and resolution data.
+
+    Raises:
+        ValueError: If no approved resolution exists.
+    """
     normalized_case_id = normalize_text(
         case_id
     )
@@ -380,6 +487,18 @@ def validate_reopening_request(
     target_status: str,
     reopening_reason: str,
 ) -> str:
+    """
+    Validate authority, case state, target state, and reopening rationale.
+
+    Returns:
+        The normalized target investigation status.
+
+    Raises:
+        ValueError:
+            If the case is not closed, the actor is not the assigned
+            supervisor, the target status is not allowed, or the reason is too
+            short.
+    """
     current_status = normalize_upper_text(
         case_row[
             "investigation_status"
@@ -407,6 +526,8 @@ def validate_reopening_request(
             "supervisor_id es obligatorio."
         )
 
+    # Only the supervisor already assigned to the case may reverse the
+    # closure decision and reactivate the investigation.
     if normalized_supervisor != case_supervisor:
         raise ValueError(
             "La reapertura debe ser autorizada "
@@ -429,6 +550,8 @@ def validate_reopening_request(
         reopening_reason
     )
 
+    # A meaningful reason is required because reopening changes the active
+    # investigation outcome and invalidates downstream supervised feedback.
     if len(normalized_reason) < 20:
         raise ValueError(
             "reopening_reason debe contener al "
@@ -450,6 +573,40 @@ def reopen_closed_case(
     target_status: str = "EN_INVESTIGACION",
     reopened_at: str | None = None,
 ) -> CaseReopeningResult:
+    """
+    Reopen a closed case and invalidate its prior supervised feedback.
+
+    The operation validates all rules before returning updated copies of the
+    case, resolution, audit, and feedback registries.
+
+    Args:
+        cases_df:
+            Case registry containing one row per case.
+        resolutions_df:
+            Structured resolution history.
+        audit_df:
+            Append-only audit history.
+        feedback_df:
+            Supervised feedback registry.
+        case_id:
+            Closed case to reopen.
+        supervisor_id:
+            Assigned supervisor authorizing the reopening.
+        reopening_reason:
+            Documented reason for reopening.
+        target_status:
+            Active investigation status to assign.
+        reopened_at:
+            Optional deterministic timestamp for tests or replay.
+
+    Returns:
+        ``CaseReopeningResult`` containing all updated registries.
+
+    Raises:
+        ValueError:
+            If schemas, authority, status, timestamp, resolution lifecycle, or
+            feedback lifecycle requirements are violated.
+    """
     validate_required_columns(
         cases_df,
         REQUIRED_CASE_COLUMNS,
@@ -530,6 +687,8 @@ def reopen_closed_case(
             f"reopened_at es inválido: {timestamp!r}"
         )
 
+    # Work on copies so a failed validation never partially mutates the
+    # caller's registries.
     updated_cases = cases_df.copy()
 
     for column in [
@@ -590,6 +749,8 @@ def reopen_closed_case(
             "encuentra vigente."
         )
 
+    # Preserve the approved resolution as historical evidence while marking
+    # that it is no longer the active conclusion after reopening.
     updated_resolutions.loc[
         resolution_index,
         "resolution_lifecycle_status",
@@ -648,6 +809,8 @@ def reopen_closed_case(
             "a la resolución aprobada."
         )
 
+    # Keep the original label for lineage, but mark it inactive so training
+    # dataset builders can exclude it deterministically.
     updated_feedback.loc[
         feedback_mask,
         "feedback_status",
