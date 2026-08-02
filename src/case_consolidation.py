@@ -1,3 +1,38 @@
+"""
+Case-level consolidation of general and digital fraud assessments.
+
+This module combines one general case assessment with zero or more digital
+event assessments. Digital events are first aggregated to one row per case,
+then merged with the general assessment to produce a consolidated operational
+view.
+
+Business interpretation
+-----------------------
+- General and digital engines remain separate sources.
+- Alert levels are combined by selecting the highest observed risk category.
+- Scores are not averaged across engines.
+- ``INCOMPLETO`` represents missing or insufficient information, not a risk
+  level above ``CRITICO``.
+- Missing digital events are preserved explicitly as ``SIN_EVENTOS``.
+- Consolidated actions are recommendations only. They do not block activity,
+  confirm fraud, or replace human investigation.
+
+Governance principles
+---------------------
+- General cases must be unique by ``case_id``.
+- Digital events must be unique by ``event_id``.
+- Digital timestamps and numeric values are validated before aggregation.
+- Event counts, maximum and mean scores, coverage, signals, and actions remain
+  available for later audit and prioritization.
+- The merge preserves all general cases, including those without digital data.
+
+Current limitations
+-------------------
+The consolidation logic is educational and rule-based. Production use would
+require formal source lineage, schema contracts, late-arriving-event handling,
+deduplication policies, calibration, and monitored data-quality thresholds.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -34,6 +69,7 @@ DIGITAL_REQUIRED_COLUMNS = {
 }
 
 
+# Ordering used only for categorical alert consolidation.
 RISK_ALERT_RANK = {
     "BAJO": 1,
     "MEDIO": 2,
@@ -46,7 +82,10 @@ def _normalize_text(
     value: Any,
 ) -> str:
     """
-    Convierte un valor textual a un formato uniforme.
+    Convert a scalar value into normalized uppercase text.
+
+    Missing values become an empty string. Other values are converted to text,
+    stripped of surrounding whitespace, and uppercased.
     """
 
     if value is None:
@@ -65,10 +104,17 @@ def highest_risk_alert(
     values: Iterable[Any],
 ) -> str:
     """
-    Obtiene la alerta de riesgo más alta.
+    Return the highest valid risk alert from an iterable.
 
-    INCOMPLETO representa falta de antecedentes,
-    no un nivel de riesgo superior.
+    ``INCOMPLETO`` represents insufficient information rather than a higher
+    risk category. It is returned only when no valid risk level is available.
+
+    Returns:
+        One of ``CRITICO``, ``ALTO``, ``MEDIO``, ``BAJO``, ``INCOMPLETO``, or
+        ``SIN_DATOS``.
+
+    Raises:
+        ValueError: If an unknown non-empty alert value is encountered.
     """
 
     risk_alerts: list[str] = []
@@ -119,10 +165,10 @@ def _join_unique_values(
     split_pipe: bool = False,
 ) -> str:
     """
-    Une valores únicos en una cadena separada por |.
+    Join unique non-empty values into a pipe-delimited string.
 
-    Cuando split_pipe es True, también separa las
-    señales que ya vienen unidas con ese símbolo.
+    When ``split_pipe`` is true, values already containing pipe-delimited items
+    are split before deduplication.
     """
 
     unique_values: set[str] = set()
@@ -165,7 +211,12 @@ def validate_general_cases(
     df: pd.DataFrame,
 ) -> None:
     """
-    Valida el archivo de evaluación general.
+    Validate the one-row-per-case general assessment table.
+
+    Raises:
+        ValueError:
+            If required columns are missing, the table is empty, or case
+            identifiers are null or duplicated.
     """
 
     missing_columns = (
@@ -216,7 +267,15 @@ def validate_digital_assessments(
     df: pd.DataFrame,
 ) -> None:
     """
-    Valida el archivo de evaluaciones digitales.
+    Validate the event-level digital assessment table.
+
+    Validation covers required columns, unique event identifiers, case
+    identifiers, valid timestamps, and numeric values between 0 and 100.
+
+    Raises:
+        ValueError:
+            If the digital source is empty, malformed, duplicated, or contains
+            invalid dates or numeric values.
     """
 
     missing_columns = (
@@ -342,8 +401,11 @@ def aggregate_digital_events_by_case(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Resume múltiples eventos digitales en una fila
-    por case_id.
+    Aggregate multiple digital events into one row per case.
+
+    The output preserves event volume, maximum and mean risk, mean coverage,
+    alert counts, highest case-level alert, latest timestamp, recommended
+    actions, and triggered signals.
     """
 
     validate_digital_assessments(df)
@@ -377,6 +439,8 @@ def aggregate_digital_events_by_case(
 
     rows: list[dict[str, Any]] = []
 
+    # Preserve transparent aggregate components instead of collapsing
+    # digital activity into a single opaque score.
     for case_id, group in working_df.groupby(
         "case_id",
         sort=True,
@@ -477,10 +541,10 @@ def combine_case_alerts(
     digital_alert: Any,
 ) -> str:
     """
-    Combina las alertas sin promediar los puntajes.
+    Combine general and digital alerts without averaging scores.
 
-    El resultado es el nivel de riesgo más alto
-    observado en cualquiera de los dos motores.
+    Returns:
+        The highest observed categorical risk level across both engines.
     """
 
     return highest_risk_alert(
@@ -495,9 +559,13 @@ def consolidated_action_for_alert(
     alert_level: str,
 ) -> str:
     """
-    Asigna una recomendación operacional.
+    Map a consolidated alert level to an operational recommendation.
 
-    No ejecuta bloqueos ni determina que hubo fraude.
+    The recommendation does not execute a block or determine that fraud
+    occurred.
+
+    Raises:
+        ValueError: If the alert level has no configured action.
     """
 
     actions = {
@@ -527,8 +595,25 @@ def consolidate_case_and_digital_data(
     digital_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Une la evaluación general con el resumen
-    de eventos digitales mediante case_id.
+    Merge general assessments with case-level digital summaries.
+
+    All general cases are preserved through a left join. Cases without digital
+    events receive explicit defaults instead of being removed.
+
+    Args:
+        general_df:
+            One-row-per-case general fraud assessment table.
+        digital_df:
+            Event-level digital fraud assessment table.
+
+    Returns:
+        A consolidated one-row-per-case DataFrame sorted by consolidated alert
+        severity and estimated loss.
+
+    Raises:
+        ValueError:
+            If either source fails schema, identifier, timestamp, or numeric
+            validation.
     """
 
     validate_general_cases(general_df)
@@ -551,6 +636,8 @@ def consolidate_case_and_digital_data(
         .astype(str)
     )
 
+    # A left join preserves every general case, including cases with no
+    # observed digital events.
     result_df = result_df.merge(
         digital_summary,
         on="case_id",
@@ -599,6 +686,8 @@ def consolidate_case_and_digital_data(
             .fillna(default_value)
         )
 
+    # Consolidation selects the highest categorical risk signal; it does not
+    # average scores produced by different engines.
     result_df[
         "consolidated_alert_level"
     ] = [
@@ -615,6 +704,7 @@ def consolidate_case_and_digital_data(
         )
     ]
 
+    # Data completeness is represented independently from risk severity.
     def determine_data_status(
         row: pd.Series,
     ) -> str:
@@ -686,6 +776,8 @@ def consolidate_case_and_digital_data(
         .fillna(-1)
     )
 
+    # Operational ordering surfaces higher consolidated risk and then larger
+    # estimated financial exposure.
     result_df = result_df.sort_values(
         by=[
             "_consolidated_priority_rank",
