@@ -1,3 +1,42 @@
+"""
+General fraud reporting, summaries, and static visualizations.
+
+This module transforms the validated case-level assessment dataset into
+portfolio metrics, category summaries, CSV/JSON exports, and static charts.
+
+Business interpretation
+-----------------------
+The reporting layer describes the case portfolio and its analytical signals.
+It does not confirm fraud, authorize enforcement actions, or replace case-level
+investigation.
+
+Main outputs
+------------
+- overall portfolio metrics;
+- metrics grouped by fraud category;
+- JSON summary files;
+- CSV category summaries;
+- alert, sector-loss, detection-delay, category-count, and category-loss charts.
+
+Governance principles
+---------------------
+- Required columns are validated before reporting.
+- Empty input datasets are rejected.
+- Numeric values are converted to standard Python types for JSON compatibility.
+- Category and alert charts use stable ordering where business meaning requires
+  it.
+- Monetary values are presented in Chilean pesos and formatted in millions only
+  for visualization.
+- Report generation does not mutate the source DataFrame.
+
+Current limitations
+-------------------
+This educational reporting layer does not yet provide interactive filtering,
+role-based access, masking of sensitive attributes, report versioning,
+confidence intervals, lineage metadata, automated distribution, or scheduled
+refreshes.
+"""
+
 from __future__ import annotations
 
 import json
@@ -31,8 +70,11 @@ def validate_reporting_data(
     df: pd.DataFrame,
 ) -> None:
     """
-    Comprueba que estén disponibles las columnas
-    necesarias para crear los informes.
+    Validate the case-level dataset required by reporting functions.
+
+    Raises:
+        ValueError:
+            If required columns are missing or the DataFrame is empty.
     """
 
     missing_columns = (
@@ -59,12 +101,20 @@ def build_summary_metrics(
     df: pd.DataFrame,
 ) -> dict[str, Any]:
     """
-    Construye las métricas generales y las métricas
-    agrupadas por categoría de fraude.
+    Build overall and grouped fraud portfolio metrics.
+
+    The result is JSON-compatible and includes case volumes, risk counts,
+    detection-delay counts, estimated losses, average analytical measures,
+    category distributions, fraud-type distributions, and leading categories.
+
+    Returns:
+        A dictionary containing portfolio-level summary metrics.
     """
 
     validate_reporting_data(df)
 
+    # Count categories independently from monetary exposure so volume and
+    # financial impact can be interpreted as separate dimensions.
     category_counts = (
         df["fraud_category"]
         .value_counts()
@@ -107,6 +157,8 @@ def build_summary_metrics(
         in fraud_type_counts.items()
     }
 
+    # Leading categories are descriptive portfolio indicators only; they do
+    # not establish causal importance or confirmed fraud prevalence.
     top_category_by_cases = (
         str(category_counts.idxmax())
         if not category_counts.empty
@@ -202,12 +254,19 @@ def build_category_summary(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Construye una tabla con las principales métricas
-    agrupadas por categoría de fraude.
+    Build a one-row-per-fraud-category summary table.
+
+    The output includes case counts, alert counts, late-detection counts,
+    estimated losses, and average risk, coverage, and detection delay.
+
+    Returns:
+        A DataFrame sorted by total estimated loss and then case volume.
     """
 
     validate_reporting_data(df)
 
+    # Aggregate at fraud-category level while preserving separate counts,
+    # exposure, risk, coverage, and detection-timing measures.
     summary = (
         df.groupby(
             "fraud_category",
@@ -297,6 +356,8 @@ def build_category_summary(
         columns_to_round
     ].round(2)
 
+    # Sort by financial exposure first and case volume second to support
+    # operational review without changing underlying risk classifications.
     summary = summary.sort_values(
         by=[
             "estimated_loss_total_clp",
@@ -318,7 +379,9 @@ def save_summary_json(
     output_path: Path,
 ) -> None:
     """
-    Guarda las métricas generales en JSON.
+    Save portfolio summary metrics as formatted UTF-8 JSON.
+
+    Parent directories are created when necessary.
     """
 
     output_path.parent.mkdir(
@@ -343,8 +406,10 @@ def save_category_summary_csv(
     output_path: Path,
 ) -> None:
     """
-    Guarda las métricas agrupadas por categoría
-    en un archivo CSV.
+    Save the fraud-category summary as a UTF-8 CSV file.
+
+    UTF-8 with BOM is used to improve compatibility with common spreadsheet
+    applications.
     """
 
     output_path.parent.mkdir(
@@ -364,7 +429,10 @@ def _format_clp_millions(
     position: int,
 ) -> str:
     """
-    Formatea montos como millones de pesos chilenos.
+    Format a numeric CLP axis value as rounded millions of pesos.
+
+    ``position`` is required by Matplotlib's formatter protocol and is not used
+    by the business calculation.
     """
 
     del position
@@ -379,9 +447,13 @@ def generate_alert_level_chart(
     output_path: Path,
 ) -> None:
     """
-    Genera un gráfico de casos por nivel de alerta.
+    Generate a bar chart of case counts by alert level.
+
+    A fixed alert order keeps visual comparisons consistent across runs.
     """
 
+    # Fixed business ordering keeps missing categories visible with zero
+    # counts and preserves comparability across reporting periods.
     alert_order = [
         "CRITICO",
         "ALTO",
@@ -438,9 +510,13 @@ def generate_sector_loss_chart(
     output_path: Path,
 ) -> None:
     """
-    Genera un gráfico de pérdidas por sector.
+    Generate a horizontal bar chart of estimated loss by sector.
+
+    Monetary values are aggregated in CLP and displayed in rounded millions.
     """
 
+    # Sector totals are descriptive sums of estimated loss, not realized-loss
+    # accounting values.
     loss_by_sector = (
         df.groupby(
             "sector"
@@ -490,10 +566,13 @@ def generate_detection_delay_chart(
     output_path: Path,
 ) -> None:
     """
-    Genera un gráfico con las categorías
-    de demora de detección.
+    Generate a bar chart of cases by detection-delay classification.
+
+    A fixed order preserves the intended operational progression from early to
+    very late detection.
     """
 
+    # Preserve the operational progression defined by case_metrics.py.
     delay_order = [
         "TEMPRANA",
         "OPORTUNA",
@@ -551,8 +630,7 @@ def generate_fraud_category_cases_chart(
     output_path: Path,
 ) -> None:
     """
-    Genera un gráfico con la cantidad de casos
-    agrupados por categoría de fraude.
+    Generate a horizontal bar chart of case volume by fraud category.
     """
 
     cases_by_category = (
@@ -596,8 +674,9 @@ def generate_fraud_category_loss_chart(
     output_path: Path,
 ) -> None:
     """
-    Genera un gráfico con la pérdida estimada
-    agrupada por categoría de fraude.
+    Generate a horizontal bar chart of estimated loss by fraud category.
+
+    Monetary values are aggregated in CLP and displayed in rounded millions.
     """
 
     loss_by_category = (
@@ -649,12 +728,22 @@ def generate_reports(
     output_directory: Path,
 ) -> list[Path]:
     """
-    Genera todos los gráficos y devuelve
-    las rutas de los archivos creados.
+    Generate the complete static chart package.
+
+    Args:
+        df:
+            Validated case-level fraud assessment dataset.
+        output_directory:
+            Directory where chart files will be created.
+
+    Returns:
+        Paths of all generated image files in deterministic order.
     """
 
     validate_reporting_data(df)
 
+    # Create only the requested reporting directory. The source DataFrame is
+    # never modified by report generation.
     output_directory.mkdir(
         parents=True,
         exist_ok=True,
