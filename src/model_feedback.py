@@ -1,3 +1,29 @@
+"""
+Investigation feedback and policy backtesting.
+
+This module links analytical assessments, generated alerts, and resolved
+investigation outcomes. It produces a feedback dataset that can be used to
+evaluate the historical behavior of a fraud-selection policy.
+
+Business interpretation
+-----------------------
+- An alert represents a positive prediction under the current policy.
+- A confirmed investigation represents an actual positive outcome.
+- A discarded investigation represents an actual negative outcome.
+- The comparison produces the four confusion-matrix categories.
+- Metrics describe only resolved and reviewed cases included in the feedback
+  dataset.
+- These metrics evaluate policy behavior; they do not by themselves prove
+  production readiness, causal effectiveness, or future performance.
+
+Scope and limitations
+---------------------
+The current implementation expects one assessment per case and one resolved
+outcome per case. It is an educational backtesting layer and does not yet
+implement temporal splitting, confidence intervals, cost-sensitive metrics,
+population drift monitoring, or production model governance.
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -38,6 +64,8 @@ REQUIRED_OUTCOME_COLUMNS = {
 }
 
 
+# Investigation outcomes supported by the current binary backtesting
+# design. CONFIRMADO is treated as the positive class.
 VALID_INVESTIGATION_OUTCOMES = {
     "CONFIRMADO",
     "DESCARTADO",
@@ -48,8 +76,10 @@ def normalize_text(
     value: Any,
 ) -> str:
     """
-    Convierte un valor en texto sin espacios
-    al comienzo ni al final.
+    Convert a scalar value into normalized text.
+
+    Missing values become an empty string. Other values are converted to text
+    and stripped of surrounding whitespace.
     """
 
     if value is None:
@@ -67,6 +97,7 @@ def normalize_text(
 def normalize_upper_text(
     value: Any,
 ) -> str:
+    """Normalize a scalar value and convert it to uppercase."""
     return normalize_text(
         value
     ).upper()
@@ -78,8 +109,10 @@ def validate_required_columns(
     dataset_name: str,
 ) -> None:
     """
-    Comprueba que un DataFrame contenga
-    las columnas necesarias.
+    Validate the minimum schema and non-empty state of a DataFrame.
+
+    Raises:
+        ValueError: If required columns are missing or the table is empty.
     """
 
     missing_columns = (
@@ -107,8 +140,11 @@ def validate_unique_identifier(
     dataset_name: str,
 ) -> None:
     """
-    Comprueba que un identificador sea obligatorio
-    y no esté repetido.
+    Require a non-empty and unique identifier column.
+
+    Raises:
+        ValueError: If the identifier contains null, blank, or duplicate
+            values.
     """
 
     if df[column].isna().any():
@@ -156,8 +192,15 @@ def validate_feedback_inputs(
     outcomes_df: pd.DataFrame,
 ) -> None:
     """
-    Valida las tres fuentes necesarias para
-    construir el conjunto de retroalimentación.
+    Validate assessment, alert, and investigation-outcome sources.
+
+    The current backtesting design requires one assessment per case and one
+    resolved outcome per case.
+
+    Raises:
+        ValueError:
+            If schemas, identifiers, outcomes, dates, reviewers, or resolution
+            summaries are invalid.
     """
 
     validate_required_columns(
@@ -209,6 +252,8 @@ def validate_feedback_inputs(
         ]
     )
 
+    # Multiple assessments per case would require an explicit temporal or
+    # version-selection rule. The current backtest rejects that ambiguity.
     if not duplicated_case_assessments.empty:
         raise ValueError(
             "Esta versión del backtesting requiere "
@@ -308,8 +353,11 @@ def classify_prediction_result(
     actual_positive: bool,
 ) -> str:
     """
-    Clasifica una predicción mediante la matriz
-    de confusión.
+    Classify one prediction using the binary confusion matrix.
+
+    Returns:
+        ``TRUE_POSITIVE``, ``FALSE_POSITIVE``, ``TRUE_NEGATIVE``, or
+        ``FALSE_NEGATIVE``.
     """
 
     if predicted_positive and actual_positive:
@@ -333,11 +381,28 @@ def build_feedback_dataset(
     outcomes_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Relaciona evaluaciones, alertas y resultados
-    de investigaciones.
+    Join assessments, alerts, and resolved investigation outcomes.
 
-    Una alerta presente representa una predicción
-    positiva bajo la política de selección actual.
+    Under the current policy design, the presence of an alert represents a
+    positive prediction. A confirmed investigation is treated as the positive
+    observed outcome.
+
+    Args:
+        assessments_df:
+            One analytical assessment per case.
+        alerts_df:
+            Alerts generated from the assessments.
+        outcomes_df:
+            One reviewed investigation outcome per resolved case.
+
+    Returns:
+        A case-level feedback DataFrame containing policy metadata, prediction,
+        observed outcome, binary label, and confusion-matrix classification.
+
+    Raises:
+        ValueError:
+            If source schemas are invalid or any resolved case lacks a related
+            assessment.
     """
 
     validate_feedback_inputs(
@@ -435,12 +500,16 @@ def build_feedback_dataset(
             f"{missing_assessments}"
         )
 
+    # Under the current selection policy, alert creation is the operational
+    # definition of a positive prediction.
     feedback_df[
         "predicted_positive"
     ] = feedback_df[
         "alert_id"
     ].notna()
 
+    # The observed target comes from the reviewed investigation outcome,
+    # never from the analytical score or alert level.
     feedback_df[
         "actual_positive"
     ] = (
@@ -557,9 +626,7 @@ def safe_divide(
     numerator: int | float,
     denominator: int | float,
 ) -> float:
-    """
-    Evita divisiones por cero.
-    """
+    """Divide two values while returning zero for a zero denominator."""
 
     if denominator == 0:
         return 0.0
@@ -573,10 +640,23 @@ def calculate_backtesting_metrics(
     feedback_df: pd.DataFrame,
 ) -> dict[str, Any]:
     """
-    Calcula métricas iniciales de clasificación.
+    Calculate initial classification metrics for resolved cases.
 
-    Estas métricas describen el comportamiento de
-    la política sobre los casos investigados.
+    Metrics describe the historical behavior of the policy over the reviewed
+    cases included in ``feedback_df``.
+
+    Args:
+        feedback_df:
+            Output produced by ``build_feedback_dataset``.
+
+    Returns:
+        A JSON-serializable dictionary containing confusion-matrix counts,
+        precision, recall, specificity, accuracy, error rates, and observed
+        engine and policy versions.
+
+    Notes:
+        These metrics are conditional on the investigated population and may
+        not represent the full transaction or customer population.
     """
 
     required_columns = {
@@ -661,6 +741,8 @@ def calculate_backtesting_metrics(
         false_negative + true_positive,
     )
 
+    # Rates use safe division because small educational samples may contain
+    # no positive or negative cases in a denominator.
     metrics: dict[str, Any] = {
         "total_resolved_cases": total,
         "true_positive": true_positive,
